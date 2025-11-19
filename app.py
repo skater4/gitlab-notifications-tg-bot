@@ -3,7 +3,7 @@ import time
 import json
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Set
 from urllib.parse import urlparse, quote
 
 import requests
@@ -28,41 +28,53 @@ FLASK_PORT = int(os.getenv("PORT", "3000"))
 GITLAB_API_TOKEN = os.getenv("GITLAB_API_TOKEN")
 GITLAB_API_TOKEN_TYPE = os.getenv("GITLAB_API_TOKEN_TYPE", "private").lower()  # "private" | "bearer"
 
-# файл, где храним GitLab ID по chat_id
-SUBSCRIPTIONS_FILE = Path(__file__).parent / "subscriptions.json"
+# файлы состояния
+BASE_DIR = Path(__file__).parent
+SUBSCRIPTIONS_FILE = BASE_DIR / "subscriptions.json"   # chat_id -> gitlab_id
+MR_REVIEWERS_FILE = BASE_DIR / "mr_reviewers.json"     # "<project_id>:<iid>" -> [reviewer_id, ...]
 
 # стикеры
 STICKER_APPROVED   = os.getenv("STICKER_APPROVED",   "CAACAgIAAxkBAAET_XxpG3JHVUs9jrnFl6xvoTrV-1Ki-QACxXUAAq0c4Ujh0t-06aOJXDYE")
 STICKER_MERGE_OK   = os.getenv("STICKER_MERGE_OK",   "CAACAgIAAxkBAAET_GZpGzi5Yf6w2obp5JQ_Bwhdbs1zTgACGQAD7CAzGfgftAqnaujQNgQ")
 STICKER_UNAPPROVAL = os.getenv("STICKER_UNAPPROVAL", "CAACAgIAAxkBAAET_H5pGz2J6GfHPuKogykmDg2K9kDtKwACEwAD7CAzGarT2GEZWCDhNgQ")
 
-# Flask-приложение для вебхука
 app = Flask(__name__)
 
+# ================== ПЕРСИСТЕНТНОЕ СОСТОЯНИЕ ==================
 
-def load_subscriptions() -> dict:
-    if SUBSCRIPTIONS_FILE.exists():
+def _load_json(path: Path, default):
+    if path.exists():
         try:
-            return json.loads(SUBSCRIPTIONS_FILE.read_text("utf-8"))
+            return json.loads(path.read_text("utf-8"))
         except Exception as e:
-            print("load_subscriptions error:", e)
-            return {}
-    return {}
+            print(f"load error for {path.name}:", e)
+    return default
 
-
-def save_subscriptions(subs: dict) -> None:
+def _save_json(path: Path, data) -> None:
     try:
-        SUBSCRIPTIONS_FILE.write_text(
-            json.dumps(subs, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
-        print("save_subscriptions error:", e)
-
+        print(f"save error for {path.name}:", e)
 
 # chat_id (str) -> gitlab_id (int)
-subscriptions: dict[str, int] = load_subscriptions()
+subscriptions: dict[str, int] = _load_json(SUBSCRIPTIONS_FILE, {})
 
+# "<project_id>:<iid>" -> list[int]
+_mr_reviewers_store: dict[str, list[int]] = _load_json(MR_REVIEWERS_FILE, {})
+
+def _mr_key(project_id: int, iid: int) -> str:
+    return f"{int(project_id)}:{int(iid)}"
+
+def _get_prev_reviewer_set(project_id: int, iid: int) -> Set[int]:
+    key = _mr_key(project_id, iid)
+    return set(_mr_reviewers_store.get(key, []))
+
+def _set_current_reviewer_set(project_id: int, iid: int, ids: Set[int]) -> None:
+    key = _mr_key(project_id, iid)
+    _mr_reviewers_store[key] = sorted(int(x) for x in ids)
+    _save_json(MR_REVIEWERS_FILE, _mr_reviewers_store)
+
+# ================== ТГ УТИЛИТЫ ==================
 
 def send_message(chat_id: int, text: str) -> None:
     try:
@@ -82,7 +94,6 @@ def send_message(chat_id: int, text: str) -> None:
     except Exception as e:
         print("send_message error:", e)
 
-
 def send_sticker(chat_id: int, file_id: str) -> None:
     try:
         resp = requests.post(
@@ -96,6 +107,7 @@ def send_sticker(chat_id: int, file_id: str) -> None:
     except Exception as e:
         print("send_sticker error:", e)
 
+# ================== КОМАНДЫ БОТА ==================
 
 def handle_start(chat_id: int) -> None:
     user_lookup_url = f'{GITLAB_BASE_URL.rstrip("/")}/api/v4/users?username=USERNAME'
@@ -110,7 +122,6 @@ def handle_start(chat_id: int) -> None:
         "   <code>15499688</code>\n\n"
         "Я сохраню этот ID для этого чата и буду использовать его, чтобы слать сюда уведомления об аппрувах твоих MR.",
     )
-
 
 def handle_gitlab_id(chat_id: int, text: str) -> None:
     raw = text.strip()
@@ -128,7 +139,7 @@ def handle_gitlab_id(chat_id: int, text: str) -> None:
         return
 
     subscriptions[str(chat_id)] = value
-    save_subscriptions(subscriptions)
+    _save_json(SUBSCRIPTIONS_FILE, subscriptions)
 
     send_message(
         chat_id,
@@ -136,15 +147,12 @@ def handle_gitlab_id(chat_id: int, text: str) -> None:
         "Теперь при аппрувах твоих MR сюда будут приходить уведомления.",
     )
 
-
 def handle_update(update: dict) -> None:
     message = update.get("message")
     if not message:
         return
-
     chat_id = message["chat"]["id"]
     text = (message.get("text") or "").strip()
-
     if not text:
         return
 
@@ -155,12 +163,10 @@ def handle_update(update: dict) -> None:
     else:
         handle_gitlab_id(chat_id, text)
 
-
 def get_updates(offset: Optional[int]) -> list[dict]:
     params: dict[str, int] = {"timeout": 30}
     if offset is not None:
         params["offset"] = offset
-
     resp = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=35)
     resp.raise_for_status()
     data = resp.json()
@@ -169,8 +175,7 @@ def get_updates(offset: Optional[int]) -> list[dict]:
         return []
     return data.get("result", [])
 
-
-# ================== GITLAB WEBHOOK ==================
+# ================== GITLAB ВСПОМОГАТЕЛЬНОЕ ==================
 
 def _api_base_from_payload(payload: dict) -> str:
     web_url = (payload.get("project") or {}).get("web_url") or ""
@@ -181,7 +186,6 @@ def _api_base_from_payload(payload: dict) -> str:
     except Exception:
         pass
     return "https://gitlab.com/api/v4"
-
 
 def _approvals_via_api(payload: dict) -> Optional[int]:
     """Вернёт approved_count (len(approved_by)) или None при ошибке/отсутствии токена."""
@@ -215,7 +219,6 @@ def _approvals_via_api(payload: dict) -> Optional[int]:
         print("approvals API exception:", e)
         return None
 
-
 def find_chats_for_author(author_id: int) -> list[int]:
     result: list[int] = []
     for chat_id_str, gitlab_id in subscriptions.items():
@@ -230,53 +233,26 @@ def find_chats_for_author(author_id: int) -> list[int]:
                 continue
     return result
 
-
 def _escape_html(text: str) -> str:
     return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
 
 def _branch_url(project_web_url: str, branch: str) -> Optional[str]:
     if not project_web_url or not branch:
         return None
     return f"{project_web_url.rstrip('/')}/-/tree/{quote(branch, safe='')}"
 
-
-def _current_reviewer_ids(payload: dict) -> set[int]:
-    ids: set[int] = set()
+def _current_reviewer_ids(payload: dict) -> Set[int]:
+    ids: Set[int] = set()
     attrs = payload.get("object_attributes") or {}
-    # объектные reviewer_ids
+
     for rid in (attrs.get("reviewer_ids") or []):
         try:
             ids.add(int(rid))
         except Exception:
             pass
-    # дублирующий список reviewers (объекты)
+
     if isinstance(payload.get("reviewers"), list):
         for r in payload["reviewers"]:
-            try:
-                ids.add(int(r.get("id")))
-            except Exception:
-                pass
-    return ids
-
-
-def _previous_reviewer_ids(payload: dict) -> set[int]:
-    ids: set[int] = set()
-    changes = payload.get("changes") or {}
-
-    # ids-формат
-    prev_ids = (changes.get("reviewer_ids") or {}).get("previous")
-    if isinstance(prev_ids, list):
-        for rid in prev_ids:
-            try:
-                ids.add(int(rid))
-            except Exception:
-                pass
-
-    # объектный формат
-    prev_objs = (changes.get("reviewers") or {}).get("previous")
-    if isinstance(prev_objs, list):
-        for r in prev_objs:
             try:
                 rid = r.get("id")
                 if rid is not None:
@@ -285,6 +261,7 @@ def _previous_reviewer_ids(payload: dict) -> set[int]:
                 pass
     return ids
 
+# ================== ВЕБХУК ==================
 
 @app.post("/gitlab/webhook")
 def gitlab_webhook():
@@ -383,17 +360,30 @@ def gitlab_webhook():
 
         return "", 200
 
-    # ===== 2) НАЗНАЧЕНИЕ/СНЯТИЕ РЕВЬЮЕРОВ =====
-    curr_ids = _current_reviewer_ids(payload)
-    prev_ids = _previous_reviewer_ids(payload)
+    # ===== 2) НАЗНАЧЕНИЕ/СНЯТИЕ РЕВЬЮЕРОВ (с дедупликацией) =====
+    project_id = attrs.get("target_project_id") or (payload.get("project") or {}).get("id")
+    if not project_id or not iid:
+        return "", 200
 
-    # при создании MR считаем всех текущих как добавленных
-    if action == "open":
-        added_ids = curr_ids
-        removed_ids = set()
-    else:
-        added_ids = curr_ids - prev_ids if curr_ids else set()
-        removed_ids = prev_ids - curr_ids if prev_ids else set()
+    try:
+        project_id_int = int(project_id)
+        iid_int = int(iid)
+    except Exception:
+        return "", 200
+
+    current_ids = _current_reviewer_ids(payload)
+    prev_ids = _get_prev_reviewer_set(project_id_int, iid_int)
+
+    # если бот впервые видит НЕ open-событие по MR — считаем, что прежнее состояние = текущее (чтобы не было ложного "назначили")
+    is_first_seen = (_mr_key(project_id_int, iid_int) not in _mr_reviewers_store)
+    if is_first_seen and action != "open":
+        prev_ids = current_ids
+
+    added_ids = current_ids - prev_ids
+    removed_ids = prev_ids - current_ids
+
+    # обновляем состояние перед отправкой (чтобы при падении/рестарте не было дребезга)
+    _set_current_reviewer_set(project_id_int, iid_int, current_ids)
 
     # уведомляем о назначении
     if added_ids:
@@ -427,17 +417,12 @@ def gitlab_webhook():
             for chat_id in chats:
                 send_message(chat_id, text)
 
-    # если что-то отправили — завершаем
-    if added_ids or removed_ids:
-        return "", 200
-
-    # неинтересное событие
+    # если состав не изменился — ничего не шлём
     return "", 200
-
 
 # ================== RUNNERS ==================
 
-def telegram_poller() -> None:
+def telegram_poller():
     print("Telegram poller started...")
     offset: Optional[int] = None
     while True:
@@ -453,20 +438,16 @@ def telegram_poller() -> None:
             print("Error in poller loop:", e)
             time.sleep(5)
 
-
-def run_flask() -> None:
+def run_flask():
     print(f"Flask server starting on 0.0.0.0:{FLASK_PORT} ...")
     app.run(host="0.0.0.0", port=FLASK_PORT)
 
-
-def main() -> None:
+def main():
     # поднимаем Flask в отдельном потоке
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-
     # запускаем long polling
     telegram_poller()
-
 
 if __name__ == "__main__":
     main()
