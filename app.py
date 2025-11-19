@@ -32,8 +32,8 @@ GITLAB_API_TOKEN_TYPE = os.getenv("GITLAB_API_TOKEN_TYPE", "private").lower()  #
 SUBSCRIPTIONS_FILE = Path(__file__).parent / "subscriptions.json"
 
 # стикеры
-STICKER_APPROVED = os.getenv("STICKER_APPROVED", "CAACAgIAAxkBAAET_XxpG3JHVUs9jrnFl6xvoTrV-1Ki-QACxXUAAq0c4Ujh0t-06aOJXDYE")
-STICKER_MERGE_OK = os.getenv("STICKER_MERGE_OK", "CAACAgIAAxkBAAET_GZpGzi5Yf6w2obp5JQ_Bwhdbs1zTgACGQAD7CAzGfgftAqnaujQNgQ")
+STICKER_APPROVED   = os.getenv("STICKER_APPROVED",   "CAACAgIAAxkBAAET_XxpG3JHVUs9jrnFl6xvoTrV-1Ki-QACxXUAAq0c4Ujh0t-06aOJXDYE")
+STICKER_MERGE_OK   = os.getenv("STICKER_MERGE_OK",   "CAACAgIAAxkBAAET_GZpGzi5Yf6w2obp5JQ_Bwhdbs1zTgACGQAD7CAzGfgftAqnaujQNgQ")
 STICKER_UNAPPROVAL = os.getenv("STICKER_UNAPPROVAL", "CAACAgIAAxkBAAET_H5pGz2J6GfHPuKogykmDg2K9kDtKwACEwAD7CAzGarT2GEZWCDhNgQ")
 
 # Flask-приложение для вебхука
@@ -241,6 +241,51 @@ def _branch_url(project_web_url: str, branch: str) -> Optional[str]:
     return f"{project_web_url.rstrip('/')}/-/tree/{quote(branch, safe='')}"
 
 
+def _current_reviewer_ids(payload: dict) -> set[int]:
+    ids: set[int] = set()
+    attrs = payload.get("object_attributes") or {}
+    # объектные reviewer_ids
+    for rid in (attrs.get("reviewer_ids") or []):
+        try:
+            ids.add(int(rid))
+        except Exception:
+            pass
+    # дублирующий список reviewers (объекты)
+    if isinstance(payload.get("reviewers"), list):
+        for r in payload["reviewers"]:
+            try:
+                ids.add(int(r.get("id")))
+            except Exception:
+                pass
+    return ids
+
+
+def _previous_reviewer_ids(payload: dict) -> set[int]:
+    ids: set[int] = set()
+    changes = payload.get("changes") or {}
+
+    # ids-формат
+    prev_ids = (changes.get("reviewer_ids") or {}).get("previous")
+    if isinstance(prev_ids, list):
+        for rid in prev_ids:
+            try:
+                ids.add(int(rid))
+            except Exception:
+                pass
+
+    # объектный формат
+    prev_objs = (changes.get("reviewers") or {}).get("previous")
+    if isinstance(prev_objs, list):
+        for r in prev_objs:
+            try:
+                rid = r.get("id")
+                if rid is not None:
+                    ids.add(int(rid))
+            except Exception:
+                pass
+    return ids
+
+
 @app.post("/gitlab/webhook")
 def gitlab_webhook():
     # проверяем секрет, если задан
@@ -254,23 +299,13 @@ def gitlab_webhook():
         return "", 200
 
     attrs = payload.get("object_attributes") or {}
-    action = attrs.get("action")
-
-    # интересуют только approved / unapproval
-    if action not in ("approved", "unapproval"):
-        return "", 200
+    action = (attrs.get("action") or "").lower()
 
     author_id = attrs.get("author_id")
-    if not author_id:
-        return "", 200
     try:
-        author_id_int = int(author_id)
+        author_id_int = int(author_id) if author_id is not None else None
     except Exception:
-        return "", 200
-
-    chats = find_chats_for_author(author_id_int)
-    if not chats:
-        return "", 200
+        author_id_int = None
 
     project_ns_path = (payload.get("project") or {}).get("path_with_namespace", "unknown")
     project_web_url = (payload.get("project") or {}).get("web_url") or ""
@@ -285,66 +320,118 @@ def gitlab_webhook():
         or "кто-то"
     )
 
-    # --- счётчики ---
-    reviewers = payload.get("reviewers") or []
-    total_reviewers = len(reviewers) if isinstance(reviewers, list) else 0
-
-    approved_count = _approvals_via_api(payload)
-    if approved_count is None:
-        approved_count = (
-            sum(1 for r in reviewers if r.get("state") == "approved")
-            if isinstance(reviewers, list) else 0
-        )
-
-    count_text = f"{approved_count} из {total_reviewers}" if total_reviewers > 0 else str(approved_count)
-
-    # статусная строка
-    if action == "approved":
-        status_line = f"✅ MR ОДОБРЕН ({count_text})"
-    else:  # unapproval
-        status_line = f"❌ Аппрув снят ({count_text})"
-
-    # ссылки
+    # ссылки/линии
     project_link = (
         f'<a href="{project_web_url}">{_escape_html(project_ns_path)}</a>'
         if project_web_url else _escape_html(project_ns_path)
     )
     src_url = _branch_url(project_web_url, source_branch)
     tgt_url = _branch_url(project_web_url, target_branch)
-
     if src_url and tgt_url:
         branch_line = f'<b>Ветка:</b> <a href="{src_url}">{_escape_html(source_branch)}</a> → <a href="{tgt_url}">{_escape_html(target_branch)}</a>\n'
     else:
         branch_line = f'<b>Ветка:</b> {_escape_html(source_branch)} → {_escape_html(target_branch)}\n'
-
     mr_line = (
         f'<b>MR:</b> <a href="{mr_url}">!{iid}</a> — {mr_title}\n'
         if mr_url else f'<b>MR:</b> !{iid} — {mr_title}\n'
     )
 
-    text = (
-        f"{status_line}\n"
-        f"<b>Проект:</b> {project_link}\n"
-        f"{mr_line}"
-        f"{branch_line}"
-        f"<b>Аппрувер:</b> {actor}\n"
-    )
+    # ===== 1) APPROVED / UNAPPROVED =====
+    if action in ("approved", "unapproved", "unapproval"):
+        if author_id_int is None:
+            return "", 200
 
-    # только для approved — добавляем «Можно мержить!» и шлём соответствующие стикеры
-    for chat_id in chats:
+        chats = find_chats_for_author(author_id_int)
+        if not chats:
+            return "", 200
+
+        reviewers = payload.get("reviewers") or []
+        total_reviewers = len(reviewers) if isinstance(reviewers, list) else 0
+
+        approved_count = _approvals_via_api(payload)
+        if approved_count is None:
+            approved_count = (
+                sum(1 for r in reviewers if r.get("state") == "approved")
+                if isinstance(reviewers, list) else 0
+            )
+        count_text = f"{approved_count} из {total_reviewers}" if total_reviewers > 0 else str(approved_count)
+
         if action == "approved":
-            if total_reviewers > 0 and approved_count >= total_reviewers:
-                text_to_send = text + "\n<b>Можно мержить!</b>"
-                send_message(chat_id, text_to_send)
-                send_sticker(chat_id, STICKER_MERGE_OK)
+            status_line = f"✅ MR ОДОБРЕН ({count_text})"
+        else:
+            status_line = f"❌ Аппрув снят ({count_text})"
+
+        text = (
+            f"{status_line}\n"
+            f"<b>Проект:</b> {project_link}\n"
+            f"{mr_line}"
+            f"{branch_line}"
+            f"<b>Аппрувер:</b> {actor}\n"
+        )
+
+        for chat_id in chats:
+            if action == "approved":
+                if total_reviewers > 0 and approved_count >= total_reviewers:
+                    send_message(chat_id, text + "\n<b>Можно мержить!</b>")
+                    send_sticker(chat_id, STICKER_MERGE_OK)
+                else:
+                    send_message(chat_id, text)
+                    send_sticker(chat_id, STICKER_APPROVED)
             else:
                 send_message(chat_id, text)
-                send_sticker(chat_id, STICKER_APPROVED)
-        else:
-            # unapproval: только сообщение и стикер ревока
-            send_message(chat_id, text)
-            send_sticker(chat_id, STICKER_UNAPPROVAL)
+                send_sticker(chat_id, STICKER_UNAPPROVAL)
 
+        return "", 200
+
+    # ===== 2) НАЗНАЧЕНИЕ/СНЯТИЕ РЕВЬЮЕРОВ =====
+    curr_ids = _current_reviewer_ids(payload)
+    prev_ids = _previous_reviewer_ids(payload)
+
+    # при создании MR считаем всех текущих как добавленных
+    if action == "open":
+        added_ids = curr_ids
+        removed_ids = set()
+    else:
+        added_ids = curr_ids - prev_ids if curr_ids else set()
+        removed_ids = prev_ids - curr_ids if prev_ids else set()
+
+    # уведомляем о назначении
+    if added_ids:
+        for added_uid in added_ids:
+            chats = find_chats_for_author(added_uid)
+            if not chats:
+                continue
+            text = (
+                "👀 <b>Вас назначили ревьюером</b>\n"
+                f"<b>Проект:</b> {project_link}\n"
+                f"{mr_line}"
+                f"{branch_line}"
+                f"<b>Назначил(а):</b> {actor}\n"
+            )
+            for chat_id in chats:
+                send_message(chat_id, text)
+
+    # уведомляем о снятии
+    if removed_ids:
+        for removed_uid in removed_ids:
+            chats = find_chats_for_author(removed_uid)
+            if not chats:
+                continue
+            text = (
+                "🚫 <b>Вас сняли из ревьюеров</b>\n"
+                f"<b>Проект:</b> {project_link}\n"
+                f"{mr_line}"
+                f"{branch_line}"
+                f"<b>Инициатор:</b> {actor}\n"
+            )
+            for chat_id in chats:
+                send_message(chat_id, text)
+
+    # если что-то отправили — завершаем
+    if added_ids or removed_ids:
+        return "", 200
+
+    # неинтересное событие
     return "", 200
 
 
